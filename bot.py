@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          🇮🇳  NSE INTRADAY STOCK SCANNER                        ║
+║          🇮🇳  NSE INTRADAY STOCK SCANNER  —  v2.0              ║
 ║   Universe  : Nifty 50 + Nifty 100 + F&O Stocks                 ║
 ║   Timeframe : 15-minute candles                                  ║
 ║   Signals   : Breakout · Trend (EMA/MACD) · RSI Reversal        ║
 ║               VWAP Bounce · Volume Spike                         ║
 ║   Alerts    : Telegram with full trade plan + indicators         ║
+║   Hosting   : Optimised for Railway.app                          ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-SETUP (one-time):
-  pip install yfinance pandas numpy requests pytz
+RAILWAY START COMMAND:
+    python nse_intraday_scanner.py --loop
 
-HOW TO RUN:
-  python nse_intraday_scanner.py            ← single scan
-  python nse_intraday_scanner.py --loop     ← auto-scan every 15 min during market hours
+LOCAL USAGE:
+    python nse_intraday_scanner.py            <- single scan
+    python nse_intraday_scanner.py --loop     <- auto-scan every N min
+    python nse_intraday_scanner.py --force    <- scan outside market hours (testing)
 
-TELEGRAM SETUP:
-  1. Open Telegram → search @BotFather → /newbot → copy your token
-  2. Message your bot once, then visit:
-     https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
-  3. Find "chat" → "id" in the JSON response
-  4. Paste both below in the CONFIG section
+RAILWAY ENV VARIABLES (set in Variables tab):
+    TELEGRAM_BOT_TOKEN   -- required
+    TELEGRAM_CHAT_ID     -- required
+    MIN_PRICE            -- default 50
+    MAX_PRICE            -- default 5000
+    MIN_AVG_VOLUME       -- default 300000
+    MIN_CONFIDENCE       -- default 55
+    SCAN_INTERVAL_MIN    -- default 15
+    SL_ATR_MULT          -- default 1.5
+    TP1_RR / TP2_RR / TP3_RR -- default 1.5 / 2.5 / 3.5
 """
 
+import os
 import sys
 import time
 import logging
 import argparse
+import traceback
 from datetime import datetime
 
 import numpy as np
@@ -36,36 +44,34 @@ import requests
 import yfinance as yf
 import pytz
 
+
 # ════════════════════════════════════════════════════════════════════
-#  ⚙️  CONFIG  —  Edit this section before running
+#  ENVIRONMENT-DRIVEN CONFIG
 # ════════════════════════════════════════════════════════════════════
 
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"   # e.g. "7123456789:AAFxxxx"
-TELEGRAM_CHAT_ID   = "YOUR_CHAT_ID_HERE"     # e.g. "-100123456789" or "123456789"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID_HERE")
 
-# ── Scan settings ──────────────────────────────────────────────────
-SCAN_INTERVAL_MIN  = 15        # Minutes between auto-scans (--loop mode)
-TIMEFRAME          = "15m"     # Candle interval
-DATA_PERIOD_DAYS   = 5         # How many days of history to pull
+SCAN_INTERVAL_MIN  = int(os.environ.get("SCAN_INTERVAL_MIN", "15"))
+TIMEFRAME          = os.environ.get("TIMEFRAME",             "15m")
+DATA_PERIOD_DAYS   = int(os.environ.get("DATA_PERIOD_DAYS",  "5"))
 
-# ── Price & Liquidity filters ───────────────────────────────────────
-MIN_PRICE          = 50        # ₹ minimum LTP
-MAX_PRICE          = 5000      # ₹ maximum LTP
-MIN_AVG_VOLUME     = 300_000   # Minimum 20-day average daily volume (3 lakh)
+MIN_PRICE          = float(os.environ.get("MIN_PRICE",       "50"))
+MAX_PRICE          = float(os.environ.get("MAX_PRICE",       "5000"))
+MIN_AVG_VOLUME     = float(os.environ.get("MIN_AVG_VOLUME",  "300000"))
+MIN_CONFIDENCE     = int(os.environ.get("MIN_CONFIDENCE",    "55"))
+MIN_RR_RATIO       = float(os.environ.get("MIN_RR_RATIO",    "1.5"))
 
-# ── Signal quality filters ──────────────────────────────────────────
-MIN_CONFIDENCE     = 55        # Minimum score (0-100) to send an alert
-MIN_RR_RATIO       = 1.5       # Minimum Risk:Reward ratio for TP1
+SL_ATR_MULT        = float(os.environ.get("SL_ATR_MULT",    "1.5"))
+TP1_RR             = float(os.environ.get("TP1_RR",          "1.5"))
+TP2_RR             = float(os.environ.get("TP2_RR",          "2.5"))
+TP3_RR             = float(os.environ.get("TP3_RR",          "3.5"))
 
-# ── ATR multipliers for SL/TP ───────────────────────────────────────
-SL_ATR_MULT        = 1.5       # Stop Loss  = LTP - (SL_ATR_MULT × ATR)
-TP1_RR             = 1.5       # TP1 Risk:Reward
-TP2_RR             = 2.5       # TP2 Risk:Reward
-TP3_RR             = 3.5       # TP3 Risk:Reward
+IST = pytz.timezone("Asia/Kolkata")
 
 
 # ════════════════════════════════════════════════════════════════════
-#  📋  STOCK UNIVERSE
+#  STOCK UNIVERSE
 # ════════════════════════════════════════════════════════════════════
 
 NIFTY_50 = [
@@ -104,58 +110,74 @@ FNO_EXTRA = [
     "SUZLON", "TATACHEM", "TATACOMM", "TVSMOTOR", "UBL", "ZEEL",
 ]
 
-# Deduplicated combined universe
-ALL_STOCKS   = list(dict.fromkeys(NIFTY_50 + NIFTY_100_EXTRA + FNO_EXTRA))
-NSE_SYMBOLS  = [s + ".NS" for s in ALL_STOCKS]
-IST          = pytz.timezone("Asia/Kolkata")
+ALL_STOCKS  = list(dict.fromkeys(NIFTY_50 + NIFTY_100_EXTRA + FNO_EXTRA))
+NSE_SYMBOLS = [s + ".NS" for s in ALL_STOCKS]
 
 
 # ════════════════════════════════════════════════════════════════════
-#  📝  LOGGING
+#  LOGGING  — stdout so Railway log viewer captures everything
 # ════════════════════════════════════════════════════════════════════
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,
 )
-log = logging.getLogger("scanner")
+logging.getLogger("yfinance").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("requests").setLevel(logging.ERROR)
+
+log = logging.getLogger("nse_scanner")
 
 
 # ════════════════════════════════════════════════════════════════════
-#  📨  TELEGRAM HELPERS
+#  TELEGRAM  — with retry + rate-limit handling
 # ════════════════════════════════════════════════════════════════════
 
-def send_telegram(text: str) -> bool:
-    """Send a message via Telegram Bot API."""
-    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+def telegram_ok() -> bool:
+    return TELEGRAM_BOT_TOKEN != "YOUR_BOT_TOKEN_HERE"
+
+
+def send_telegram(text: str, retries: int = 3) -> bool:
+    if not telegram_ok():
         print("\n" + "─" * 60)
-        print("📨  TELEGRAM ALERT (bot not configured — printing here):")
+        print("📨  TELEGRAM (not configured — console output):")
         print(text)
-        print("─" * 60)
+        print("─" * 60 + "\n", flush=True)
         return True
 
     url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id":    TELEGRAM_CHAT_ID,
-        "text":       text,
-        "parse_mode": "HTML",
+        "chat_id":                  TELEGRAM_CHAT_ID,
+        "text":                     text,
+        "parse_mode":               "HTML",
+        "disable_web_page_preview": True,
     }
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code == 200:
-            return True
-        log.warning(f"Telegram API error {r.status_code}: {r.text[:120]}")
-    except requests.RequestException as e:
-        log.error(f"Telegram send failed: {e}")
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(url, json=payload, timeout=15)
+            if r.status_code == 200:
+                return True
+            if r.status_code == 429:
+                wait = r.json().get("parameters", {}).get("retry_after", 5)
+                log.warning(f"Telegram rate-limited — waiting {wait}s …")
+                time.sleep(wait)
+                continue
+            log.warning(f"Telegram {r.status_code}: {r.text[:120]}")
+        except requests.RequestException as e:
+            log.warning(f"Telegram attempt {attempt}/{retries}: {e}")
+            if attempt < retries:
+                time.sleep(3)
     return False
 
 
 # ════════════════════════════════════════════════════════════════════
-#  📐  TECHNICAL INDICATORS  (pure pandas/numpy — no extra libs)
+#  TECHNICAL INDICATORS  (pure pandas/numpy — no extra deps)
 # ════════════════════════════════════════════════════════════════════
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def ind_rsi(series: pd.Series, period=14) -> pd.Series:
     delta = series.diff()
     gain  = delta.clip(lower=0).rolling(period).mean()
     loss  = (-delta.clip(upper=0)).rolling(period).mean()
@@ -163,323 +185,322 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def macd(series: pd.Series, fast=12, slow=26, signal=9):
-    ema_f   = series.ewm(span=fast,   adjust=False).mean()
-    ema_s   = series.ewm(span=slow,   adjust=False).mean()
-    line    = ema_f - ema_s
-    sig     = line.ewm(span=signal, adjust=False).mean()
-    hist    = line - sig
-    return line, sig, hist
+def ind_macd(series: pd.Series, fast=12, slow=26, signal=9):
+    ef  = series.ewm(span=fast,   adjust=False).mean()
+    es  = series.ewm(span=slow,   adjust=False).mean()
+    lin = ef - es
+    sig = lin.ewm(span=signal, adjust=False).mean()
+    return lin, sig, lin - sig
 
 
-def ema(series: pd.Series, span: int) -> pd.Series:
+def ind_ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
-def vwap(df: pd.DataFrame) -> pd.Series:
-    tp  = (df["High"] + df["Low"] + df["Close"]) / 3
-    cum = (tp * df["Volume"]).cumsum()
-    return cum / df["Volume"].cumsum()
+def ind_vwap(df: pd.DataFrame) -> pd.Series:
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    return (tp * df["Volume"]).cumsum() / df["Volume"].cumsum()
 
 
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    hl  = df["High"] - df["Low"]
-    hc  = (df["High"] - df["Close"].shift()).abs()
-    lc  = (df["Low"]  - df["Close"].shift()).abs()
-    tr  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+def ind_atr(df: pd.DataFrame, period=14) -> pd.Series:
+    hl = df["High"] - df["Low"]
+    hc = (df["High"] - df["Close"].shift()).abs()
+    lc = (df["Low"]  - df["Close"].shift()).abs()
+    return pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(period).mean()
 
 
-def bollinger(series: pd.Series, period: int = 20, num_std: float = 2.0):
-    mid   = series.rolling(period).mean()
-    std   = series.rolling(period).std()
-    upper = mid + num_std * std
-    lower = mid - num_std * std
-    return upper, mid, lower
+def ind_bollinger(series: pd.Series, period=20, std=2.0):
+    mid = series.rolling(period).mean()
+    sd  = series.rolling(period).std()
+    return mid + std * sd, mid, mid - std * sd
 
 
-def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    hi, lo, cl = df["High"], df["Low"], df["Close"]
-    plus_dm    = hi.diff().clip(lower=0)
-    minus_dm   = (-lo.diff()).clip(lower=0)
-    plus_dm[plus_dm  < minus_dm] = 0
-    minus_dm[minus_dm < plus_dm] = 0
-    tr_   = atr(df, period=1)
-    atr_  = tr_.rolling(period).mean()
-    plus_di  = 100 * plus_dm.rolling(period).mean()  / atr_.replace(0, np.nan)
-    minus_di = 100 * minus_dm.rolling(period).mean() / atr_.replace(0, np.nan)
-    dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+def ind_adx(df: pd.DataFrame, period=14) -> pd.Series:
+    hi, lo  = df["High"], df["Low"]
+    pdm     = hi.diff().clip(lower=0)
+    mdm     = (-lo.diff()).clip(lower=0)
+    pdm[pdm < mdm] = 0
+    mdm[mdm < pdm] = 0
+    atr_1   = ind_atr(df, 1).rolling(period).mean().replace(0, np.nan)
+    pdi     = 100 * pdm.rolling(period).mean() / atr_1
+    mdi     = 100 * mdm.rolling(period).mean() / atr_1
+    dx      = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
     return dx.rolling(period).mean()
 
 
-def supertrend(df: pd.DataFrame, period: int = 10, mult: float = 3.0):
-    """Returns (direction Series): +1 = bullish, -1 = bearish."""
-    atr_   = atr(df, period)
+def ind_supertrend(df: pd.DataFrame, period=10, mult=3.0) -> pd.Series:
+    at     = ind_atr(df, period)
     hl2    = (df["High"] + df["Low"]) / 2
-    upper  = hl2 + mult * atr_
-    lower  = hl2 - mult * atr_
+    upper  = hl2 + mult * at
+    lower  = hl2 - mult * at
     close  = df["Close"]
-    direction = pd.Series(0, index=df.index, dtype=int)
+    d      = pd.Series(0, index=df.index, dtype=int)
     for i in range(1, len(df)):
-        if close.iloc[i] > upper.iloc[i - 1]:
-            direction.iloc[i] = 1
-        elif close.iloc[i] < lower.iloc[i - 1]:
-            direction.iloc[i] = -1
-        else:
-            direction.iloc[i] = direction.iloc[i - 1]
-    return direction
+        if   close.iloc[i] > upper.iloc[i - 1]: d.iloc[i] =  1
+        elif close.iloc[i] < lower.iloc[i - 1]: d.iloc[i] = -1
+        else:                                    d.iloc[i] =  d.iloc[i - 1]
+    return d
 
 
 # ════════════════════════════════════════════════════════════════════
-#  🔎  SIGNAL DETECTION ENGINE
+#  SIGNAL DETECTION ENGINE
 # ════════════════════════════════════════════════════════════════════
+
+def _fv(series: pd.Series, idx: int = -1) -> float:
+    return float(series.iloc[idx])
+
 
 def detect_signals(df: pd.DataFrame, symbol: str) -> dict | None:
-    """
-    Analyse a 15-minute OHLCV DataFrame.
-    Returns a result dict if signals are found, else None.
-    """
     if df is None or len(df) < 55:
         return None
 
-    # ── flatten multi-index columns if yfinance returns them ─────────
+    # Flatten yfinance multi-index columns
     if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
         df.columns = df.columns.get_level_values(0)
 
     close  = df["Close"]
     volume = df["Volume"]
 
-    # ── Compute all indicators ────────────────────────────────────────
-    rsi_s          = rsi(close)
-    macd_l, sig_l, hist_s = macd(close)
-    ema9_s         = ema(close, 9)
-    ema21_s        = ema(close, 21)
-    ema50_s        = ema(close, 50)
-    vwap_s         = vwap(df)
-    atr_s          = atr(df)
-    bb_up, _, bb_lo = bollinger(close)
-    adx_s          = adx(df)
-    st_dir         = supertrend(df)
+    # ── Indicators ────────────────────────────────────────────────────
+    rsi_s                 = ind_rsi(close)
+    macd_l, sig_l, hist_s = ind_macd(close)
+    ema9_s                = ind_ema(close, 9)
+    ema21_s               = ind_ema(close, 21)
+    ema50_s               = ind_ema(close, 50)
+    vwap_s                = ind_vwap(df)
+    atr_s                 = ind_atr(df)
+    bb_up, _, bb_lo       = ind_bollinger(close)
+    adx_s                 = ind_adx(df)
+    st_d                  = ind_supertrend(df)
 
-    # ── Last-bar snapshot ─────────────────────────────────────────────
-    ltp       = round(float(close.iloc[-1]),   2)
-    rsi_v     = round(float(rsi_s.iloc[-1]),   2)
-    rsi_prev  = float(rsi_s.iloc[-2])
-    macd_v    = round(float(macd_l.iloc[-1]),  4)
-    sig_v     = round(float(sig_l.iloc[-1]),   4)
-    hist_v    = round(float(hist_s.iloc[-1]),  4)
-    hist_prev = float(hist_s.iloc[-2])
-    ema9_v    = float(ema9_s.iloc[-1])
-    ema21_v   = float(ema21_s.iloc[-1])
-    ema50_v   = float(ema50_s.iloc[-1])
-    vwap_v    = round(float(vwap_s.iloc[-1]),  2)
-    vwap_prev = float(vwap_s.iloc[-2])
-    atr_v     = float(atr_s.iloc[-1])
-    adx_v     = round(float(adx_s.iloc[-1]),   2)
-    st_now    = int(st_dir.iloc[-1])
-    bb_up_v   = float(bb_up.iloc[-1])
-    bb_lo_v   = float(bb_lo.iloc[-1])
+    # ── Snapshot ──────────────────────────────────────────────────────
+    ltp       = round(_fv(close),    2)
+    rsi_v     = round(_fv(rsi_s),    2)
+    rsi_p     =       _fv(rsi_s, -2)
+    hist_v    = round(_fv(hist_s),   4)
+    hist_p    =       _fv(hist_s,-2)
+    macd_v    = round(_fv(macd_l),   4)
+    sig_v     = round(_fv(sig_l),    4)
+    ema9_v    =       _fv(ema9_s)
+    ema21_v   =       _fv(ema21_s)
+    ema50_v   =       _fv(ema50_s)
+    vwap_v    = round(_fv(vwap_s),   2)
+    vwap_p    =       _fv(vwap_s,-2)
+    atr_v     =       _fv(atr_s)
+    adx_v     = round(_fv(adx_s),    2)
+    st_now    =   int(_fv(st_d))
+    bb_up_v   =       _fv(bb_up)
+    bb_lo_v   =       _fv(bb_lo)
 
-    avg_vol_20  = float(volume.rolling(20).mean().iloc[-1])
-    curr_vol    = float(volume.iloc[-1])
-    vol_ratio   = curr_vol / avg_vol_20 if avg_vol_20 > 0 else 0
-    vol_spike_p = round((vol_ratio - 1) * 100, 1)
+    avg_vol   = float(volume.rolling(20).mean().iloc[-1])
+    cur_vol   = float(volume.iloc[-1])
+    vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 0
+    vol_pct   = round((vol_ratio - 1) * 100, 1)
 
     # ── Pre-filters ───────────────────────────────────────────────────
-    if not (MIN_PRICE <= ltp <= MAX_PRICE):
-        return None
-    if avg_vol_20 < MIN_AVG_VOLUME:
-        return None
-    if np.isnan(atr_v) or atr_v <= 0:
-        return None
+    if not (MIN_PRICE <= ltp <= MAX_PRICE):   return None
+    if avg_vol < MIN_AVG_VOLUME:              return None
+    if np.isnan(atr_v) or atr_v <= 0:        return None
+    if np.isnan(adx_v):                       return None
 
-    # ── Signal evaluation ─────────────────────────────────────────────
-    signals_found = []
-    score         = 0
+    # ── Signal scoring ────────────────────────────────────────────────
+    found = []
+    score = 0
 
-    # 1. BREAKOUT SIGNAL  ──────────────────────────────────────────────
-    #    Price crosses above 20-period high (resistance) with volume surge
+    # 1. BREAKOUT
     resistance = float(close.rolling(20).max().iloc[-2])
     if ltp > resistance and vol_ratio >= 1.5:
-        signals_found.append("🚀 Breakout above resistance")
+        found.append("🚀 Price Breakout above 20-period resistance")
         score += 25
-    # Bollinger Band upper breakout
-    if close.iloc[-2] < bb_up.iloc[-2] and ltp > bb_up_v and vol_ratio >= 1.3:
-        signals_found.append("🚀 Bollinger Upper Breakout")
+
+    if _fv(close, -2) < _fv(bb_up, -2) and ltp > bb_up_v and vol_ratio >= 1.3:
+        found.append("🚀 Bollinger Band Upper Breakout")
         score += 15
 
-    # 2. TREND-FOLLOWING  ──────────────────────────────────────────────
-    ema_bull = ema9_v > ema21_v > ema50_v
-    macd_cross_bull = hist_v > 0 and hist_prev <= 0   # fresh bullish cross
-    if ema_bull and macd_cross_bull:
-        signals_found.append("📈 Trend: EMA stack + fresh MACD cross")
+    # 2. TREND-FOLLOWING
+    ema_bull       = ema9_v > ema21_v > ema50_v
+    macd_fresh     = hist_v > 0 and hist_p <= 0
+    if ema_bull and macd_fresh:
+        found.append("📈 Trend: EMA stack + fresh MACD crossover")
         score += 28
     elif ema_bull and macd_v > sig_v:
-        signals_found.append("📈 Trend: EMA bullish stack")
+        found.append("📈 Trend: EMA bullish stack")
         score += 16
 
-    # 3. RSI REVERSAL  ─────────────────────────────────────────────────
-    #    RSI rising from oversold territory (30-55 band), turning up
-    if 35 <= rsi_v <= 58 and rsi_v > rsi_prev and rsi_prev < 50:
-        signals_found.append("🔄 RSI Reversal (rising from oversold)")
+    # 3. RSI REVERSAL
+    if 35 <= rsi_v <= 58 and rsi_v > rsi_p and rsi_p < 50:
+        found.append("🔄 RSI Reversal — rising from oversold zone")
         score += 20
 
-    # 4. VWAP BOUNCE  ──────────────────────────────────────────────────
-    #    Price was below VWAP, crossed above with volume
-    price_was_below = float(close.iloc[-2]) < vwap_prev
-    price_now_above = ltp > vwap_v
-    if price_was_below and price_now_above and vol_ratio >= 1.0:
-        signals_found.append("💹 VWAP Bounce (price crossed above VWAP)")
+    # 4. VWAP BOUNCE
+    if _fv(close, -2) < vwap_p and ltp > vwap_v and vol_ratio >= 1.0:
+        found.append("💹 VWAP Bounce — price crossed above VWAP")
         score += 22
 
-    # 5. VOLUME SPIKE  ─────────────────────────────────────────────────
+    # 5. VOLUME SPIKE
     if vol_ratio >= 2.0:
-        signals_found.append(f"🔊 Volume Spike: {vol_spike_p}% above 20D avg")
+        found.append(f"🔊 Volume Spike: +{vol_pct}% above 20D avg")
         score += 15
     elif vol_ratio >= 1.5:
-        signals_found.append(f"🔊 Volume Surge: {vol_spike_p}% above 20D avg")
+        found.append(f"🔊 Volume Surge: +{vol_pct}% above 20D avg")
         score += 8
 
-    # ── Bonus modifiers ───────────────────────────────────────────────
-    if adx_v > 25:        score += 8    # Strong trend
-    if st_now == 1:       score += 10   # Supertrend bullish
-    if ltp > vwap_v:      score += 5    # Price above VWAP
-    if ema9_v > ema21_v:  score += 4    # Short-term EMA positive
+    # Bonus modifiers
+    if adx_v  > 25:       score += 8
+    if st_now == 1:       score += 10
+    if ltp    > vwap_v:   score += 5
+    if ema9_v > ema21_v:  score += 4
 
     score = min(score, 100)
 
-    # ── Quality gate ──────────────────────────────────────────────────
-    if not signals_found:
-        return None
-    if score < MIN_CONFIDENCE:
+    if not found or score < MIN_CONFIDENCE:
         return None
 
-    # ── Trade Plan (ATR-based) ────────────────────────────────────────
+    # ── Trade plan ────────────────────────────────────────────────────
     sl   = round(ltp - SL_ATR_MULT * atr_v, 2)
     risk = ltp - sl
     if risk <= 0:
         return None
 
-    tp1  = round(ltp + TP1_RR * risk, 2)
-    tp2  = round(ltp + TP2_RR * risk, 2)
-    tp3  = round(ltp + TP3_RR * risk, 2)
+    tp1 = round(ltp + TP1_RR * risk, 2)
+    tp2 = round(ltp + TP2_RR * risk, 2)
+    tp3 = round(ltp + TP3_RR * risk, 2)
 
-    # Verify R:R meets minimum
     if (tp1 - ltp) / risk < MIN_RR_RATIO:
         return None
 
     return {
-        "symbol":       symbol.replace(".NS", ""),
-        "ltp":          ltp,
-        "signals":      signals_found,
-        "score":        score,
-        # Indicators
-        "rsi":          rsi_v,
-        "macd":         macd_v,
-        "macd_hist":    hist_v,
-        "ema9":         round(ema9_v,  2),
-        "ema21":        round(ema21_v, 2),
-        "ema50":        round(ema50_v, 2),
-        "vwap":         vwap_v,
-        "adx":          adx_v,
-        "supertrend":   "🟢 BUY" if st_now == 1 else "🔴 SELL",
-        "above_vwap":   ltp > vwap_v,
-        "vol_spike_p":  vol_spike_p,
-        "avg_vol_20":   int(avg_vol_20),
-        "curr_vol":     int(curr_vol),
-        "bb_upper":     round(bb_up_v, 2),
-        "bb_lower":     round(bb_lo_v, 2),
-        # Trade plan
-        "entry":        ltp,
-        "sl":           sl,
-        "tp1":          tp1,
-        "tp2":          tp2,
-        "tp3":          tp3,
-        "atr":          round(atr_v, 2),
-        "risk_per_share": round(risk, 2),
+        "symbol":     symbol.replace(".NS", ""),
+        "ltp":        ltp,
+        "signals":    found,
+        "score":      score,
+        "rsi":        rsi_v,
+        "macd":       macd_v,
+        "macd_hist":  hist_v,
+        "ema9":       round(ema9_v,  2),
+        "ema21":      round(ema21_v, 2),
+        "ema50":      round(ema50_v, 2),
+        "vwap":       vwap_v,
+        "adx":        adx_v,
+        "supertrend": "🟢 BUY" if st_now == 1 else "🔴 SELL",
+        "above_vwap": ltp > vwap_v,
+        "vol_pct":    vol_pct,
+        "cur_vol":    int(cur_vol),
+        "avg_vol":    int(avg_vol),
+        "bb_upper":   round(bb_up_v, 2),
+        "bb_lower":   round(bb_lo_v, 2),
+        "entry":      ltp,
+        "sl":         sl,
+        "tp1":        tp1,
+        "tp2":        tp2,
+        "tp3":        tp3,
+        "atr":        round(atr_v,  2),
+        "risk":       round(risk,   2),
     }
 
 
 # ════════════════════════════════════════════════════════════════════
-#  📨  TELEGRAM MESSAGE FORMATTER
+#  TELEGRAM MESSAGE FORMATTERS
 # ════════════════════════════════════════════════════════════════════
 
-def format_alert(r: dict) -> str:
-    bar     = "━" * 30
-    stars   = "⭐" * (r["score"] // 20)
-    signals = "\n    ".join(r["signals"])
-    vwap_lbl = "✅ Above VWAP" if r["above_vwap"] else "❌ Below VWAP"
-    rsi_lbl  = "✅ Good" if r["rsi"] < 60 else "⚠️ Overbought"
-    adx_lbl  = "✅ Strong trend" if r["adx"] > 25 else "〰️ Weak trend"
-    now_str  = datetime.now(IST).strftime("%d %b %Y  %I:%M %p IST")
+def pct_diff(new_val, base):
+    return round(((new_val - base) / base) * 100, 2)
 
-    sl_pct   = round(((r["ltp"] - r["sl"])  / r["ltp"]) * 100, 2)
-    tp1_pct  = round(((r["tp1"] - r["ltp"]) / r["ltp"]) * 100, 2)
-    tp2_pct  = round(((r["tp2"] - r["ltp"]) / r["ltp"]) * 100, 2)
-    tp3_pct  = round(((r["tp3"] - r["ltp"]) / r["ltp"]) * 100, 2)
+
+def format_alert(r: dict) -> str:
+    bar      = "━" * 32
+    stars    = "⭐" * (r["score"] // 20)
+    sigs     = "\n    ".join(r["signals"])
+    now_str  = datetime.now(IST).strftime("%d %b %Y  %I:%M %p IST")
+    vwap_lbl = "✅ Above VWAP"  if r["above_vwap"] else "❌ Below VWAP"
+    adx_lbl  = "✅ Strong"      if r["adx"] > 25   else "〰️ Weak"
+    rsi_lbl  = "✅"             if r["rsi"] < 60   else "⚠️ Overbought"
+    sl_pct   = abs(pct_diff(r["sl"],  r["ltp"]))
+    tp1_pct  = pct_diff(r["tp1"], r["ltp"])
+    tp2_pct  = pct_diff(r["tp2"], r["ltp"])
+    tp3_pct  = pct_diff(r["tp3"], r["ltp"])
 
     return f"""
-🇮🇳 <b>NSE INTRADAY SIGNAL</b> 🔔
+🇮🇳 <b>NSE INTRADAY SIGNAL 🔔</b>
 {bar}
-📌 <b>Stock :</b> <code>{r["symbol"]}</code>  |  NSE
-💰 <b>LTP   :</b> ₹{r["ltp"]}
-📅 <b>Time  :</b> {now_str}
+📌 <b>Stock  :</b> <code>{r["symbol"]}</code>  |  NSE
+💰 <b>LTP    :</b> ₹{r["ltp"]}
+📅 <b>Time   :</b> {now_str}
 {bar}
-<b>📡 SIGNALS TRIGGERED:</b>
-    {signals}
+<b>📡 SIGNALS TRIGGERED</b>
+    {sigs}
 {bar}
 <b>🎯 TRADE PLAN  (15-min chart)</b>
 
-  ➤ <b>Entry :</b>  ₹{r["entry"]}
-  🛡 <b>SL    :</b>  ₹{r["sl"]}   <i>(-{sl_pct}%  |  ATR × {SL_ATR_MULT})</i>
-  🎯 <b>TP 1  :</b>  ₹{r["tp1"]}  <i>(+{tp1_pct}%  |  RR 1:{TP1_RR})</i>
-  🎯 <b>TP 2  :</b>  ₹{r["tp2"]}  <i>(+{tp2_pct}%  |  RR 1:{TP2_RR})</i>
-  🎯 <b>TP 3  :</b>  ₹{r["tp3"]}  <i>(+{tp3_pct}%  |  RR 1:{TP3_RR})</i>
-  📏 <b>ATR(14):</b> ₹{r["atr"]}   |  Risk/share: ₹{r["risk_per_share"]}
+  ➤ <b>Entry :</b> ₹{r["entry"]}
+  🛡 <b>SL    :</b> ₹{r["sl"]}   <i>(-{sl_pct}%  |  ATR ×{SL_ATR_MULT})</i>
+  🎯 <b>TP 1  :</b> ₹{r["tp1"]}  <i>(+{tp1_pct}%  |  RR 1:{TP1_RR})</i>
+  🎯 <b>TP 2  :</b> ₹{r["tp2"]}  <i>(+{tp2_pct}%  |  RR 1:{TP2_RR})</i>
+  🎯 <b>TP 3  :</b> ₹{r["tp3"]}  <i>(+{tp3_pct}%  |  RR 1:{TP3_RR})</i>
+  📏 <b>ATR   :</b> ₹{r["atr"]}   |  Risk/share: ₹{r["risk"]}
 {bar}
-<b>📊 INDICATORS SNAPSHOT</b>
+<b>📊 INDICATORS</b>
 
-  RSI (14)      : {r["rsi"]}   {rsi_lbl}
-  MACD          : {r["macd"]}  (Hist: {r["macd_hist"]})
-  EMA 9 / 21 / 50: {r["ema9"]} / {r["ema21"]} / {r["ema50"]}
-  VWAP          : ₹{r["vwap"]}   {vwap_lbl}
-  ADX (14)      : {r["adx"]}   {adx_lbl}
-  Supertrend    : {r["supertrend"]}
-  BB Upper/Lower: {r["bb_upper"]} / {r["bb_lower"]}
-  Volume (curr) : {r["curr_vol"]:,}
-  Vol vs 20D avg: +{r["vol_spike_p"]}%
+  RSI (14)       : {r["rsi"]}  {rsi_lbl}
+  MACD           : {r["macd"]}  (Hist: {r["macd_hist"]})
+  EMA  9/21/50   : {r["ema9"]} / {r["ema21"]} / {r["ema50"]}
+  VWAP           : ₹{r["vwap"]}  {vwap_lbl}
+  ADX (14)       : {r["adx"]}  {adx_lbl}
+  Supertrend     : {r["supertrend"]}
+  BB Upper/Lower : {r["bb_upper"]} / {r["bb_lower"]}
+  Volume (curr)  : {r["cur_vol"]:,}
+  Vol vs 20D avg : +{r["vol_pct"]}%
 {bar}
-<b>🧠 CONFIDENCE SCORE: {r["score"]} / 100</b>
-{stars}
+<b>🧠 CONFIDENCE: {r["score"]} / 100</b>  {stars}
 {bar}
 ⚠️ <i>Educational use only. Not SEBI-registered advice.
-   Always apply your own risk management.</i>
-""".strip()
+   Always manage your own risk.</i>""".strip()
 
 
-def format_summary(results: list[dict], scan_time: str) -> str:
+def format_summary(results: list, scan_time: str) -> str:
     lines = [
         f"📊 <b>NSE Scan Complete</b> — {scan_time}",
-        f"Found <b>{len(results)}</b> signal(s)\n",
+        f"Scanned <b>{len(NSE_SYMBOLS)}</b> stocks  |  Found <b>{len(results)}</b> signal(s)\n",
     ]
     for r in results:
         stars = "⭐" * (r["score"] // 20)
         lines.append(
             f"{stars} <code>{r['symbol']}</code>  ₹{r['ltp']}"
-            f"  |  Score: <b>{r['score']}/100</b>"
-            f"  |  SL ₹{r['sl']}  TP1 ₹{r['tp1']}"
+            f"  Score:<b>{r['score']}</b>"
+            f"  SL:₹{r['sl']}  TP1:₹{r['tp1']}"
         )
     return "\n".join(lines)
 
 
+def format_no_signals(scan_time: str) -> str:
+    return (
+        f"📊 <b>NSE Scan</b> — {scan_time}\n"
+        f"No qualifying signals this cycle.\n"
+        f"(Threshold: {MIN_CONFIDENCE}/100)"
+    )
+
+
+def format_startup() -> str:
+    return (
+        f"🟢 <b>NSE Scanner Online</b>\n"
+        f"Universe : {len(ALL_STOCKS)} stocks (Nifty50 + Nifty100 + F&O)\n"
+        f"Timeframe: {TIMEFRAME}  |  Every {SCAN_INTERVAL_MIN} min\n"
+        f"Market   : Mon–Fri  09:15–15:30 IST\n"
+        f"Min score: {MIN_CONFIDENCE}/100  |  Min R:R 1:{MIN_RR_RATIO}\n"
+        f"Price    : ₹{int(MIN_PRICE)}–₹{int(MAX_PRICE)}\n"
+        f"SL: ATR×{SL_ATR_MULT}  TP: {TP1_RR}/{TP2_RR}/{TP3_RR}"
+    )
+
+
 # ════════════════════════════════════════════════════════════════════
-#  🔄  MAIN SCAN LOGIC
+#  MAIN SCAN
 # ════════════════════════════════════════════════════════════════════
 
-def run_scan() -> list[dict]:
+def run_scan() -> list:
     now_ist   = datetime.now(IST)
     scan_time = now_ist.strftime("%d %b %Y  %I:%M %p IST")
-    log.info(f"🔍  Scan started at {scan_time}  |  Universe: {len(NSE_SYMBOLS)} stocks")
+    log.info(f"🔍  Scan — {scan_time} — {len(NSE_SYMBOLS)} stocks")
 
     results, errors = [], 0
 
@@ -492,112 +513,150 @@ def run_scan() -> list[dict]:
                 progress=False,
                 auto_adjust=True,
             )
-            result = detect_signals(df, sym)
-            if result:
-                results.append(result)
-                sigs_short = " + ".join([s.split(" ")[1] for s in result["signals"]])
-                log.info(f"  ✅  {result['symbol']:15s}  LTP ₹{result['ltp']:>8.2f}  Score {result['score']:>3}  [{sigs_short}]")
-        except Exception as e:
+            r = detect_signals(df, sym)
+            if r:
+                results.append(r)
+                short = " + ".join(s.split(" ")[1] for s in r["signals"])
+                log.info(f"  ✅  {r['symbol']:16s}  ₹{r['ltp']:>8.2f}  Score:{r['score']:>3}  [{short}]")
+        except Exception:
             errors += 1
-            log.debug(f"  ⚠️  {sym}: {e}")
-        time.sleep(0.25)     # polite rate limiting for yfinance
+            log.debug(f"  ⚠️  {sym}: {traceback.format_exc(limit=1)}")
+        time.sleep(0.25)
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    log.info(f"✅  Scan done — {len(results)} signals found  ({errors} fetch errors)")
+    log.info(f"✅  Scan done — {len(results)} signals | {errors} errors")
 
-    # ── Send Telegram alerts ──────────────────────────────────────────
     if not results:
-        send_telegram(f"📊 <b>NSE Scan</b> — {scan_time}\nNo qualifying signals found this cycle.")
+        send_telegram(format_no_signals(scan_time))
         return results
 
-    # Summary message
     send_telegram(format_summary(results, scan_time))
     time.sleep(1)
-
-    # Individual detailed alerts
     for r in results:
         send_telegram(format_alert(r))
-        time.sleep(0.6)
+        time.sleep(0.8)
 
     return results
 
 
 # ════════════════════════════════════════════════════════════════════
-#  ▶️  ENTRY POINT
+#  MARKET HOURS HELPERS
 # ════════════════════════════════════════════════════════════════════
-
-def print_banner():
-    print("""
-╔══════════════════════════════════════════════════════════════╗
-║       🇮🇳  NSE Intraday Stock Scanner  —  v1.0              ║
-║   Universe : Nifty 50 + Nifty 100 + F&O  ({} stocks)     ║
-║   Timeframe: 15m   |   Data source: yfinance (free)         ║
-╚══════════════════════════════════════════════════════════════╝
-""".format(len(ALL_STOCKS)))
-
-
-def check_telegram_config():
-    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("⚠️  Telegram NOT configured — alerts will print to console.\n")
-        print("   To configure Telegram:")
-        print("   1. Open Telegram → @BotFather → /newbot → copy token")
-        print("   2. Message your bot once")
-        print("   3. Visit: https://api.telegram.org/bot<TOKEN>/getUpdates")
-        print("   4. Copy chat.id from the response JSON")
-        print("   5. Paste both into TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID above\n")
-
 
 def is_market_open() -> bool:
     now = datetime.now(IST)
-    # Skip weekends
     if now.weekday() >= 5:
         return False
-    market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return market_open <= now <= market_close
+    o = now.replace(hour=9,  minute=15, second=0, microsecond=0)
+    c = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return o <= now <= c
 
+
+def secs_to_open() -> int:
+    now = datetime.now(IST)
+    o   = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now < o:
+        return int((o - now).total_seconds())
+    return 0
+
+
+# ════════════════════════════════════════════════════════════════════
+#  STARTUP DISPLAY
+# ════════════════════════════════════════════════════════════════════
+
+def print_banner():
+    print(f"""
+╔══════════════════════════════════════════════════════════╗
+║    🇮🇳  NSE Intraday Stock Scanner  —  v2.0             ║
+║  Universe : {len(ALL_STOCKS)} stocks  |  Timeframe : {TIMEFRAME}              ║
+║  Hosting  : Railway.app  |  Data : yfinance (free)     ║
+╚══════════════════════════════════════════════════════════╝
+""", flush=True)
+
+
+def log_config():
+    log.info("── Config ────────────────────────────────────────────────")
+    log.info(f"  Telegram    : {'✅ Configured' if telegram_ok() else '❌ Not configured (console only)'}")
+    log.info(f"  Universe    : {len(ALL_STOCKS)} stocks")
+    log.info(f"  Timeframe   : {TIMEFRAME}  |  Interval: {SCAN_INTERVAL_MIN} min")
+    log.info(f"  Price       : ₹{int(MIN_PRICE)} – ₹{int(MAX_PRICE)}")
+    log.info(f"  Min volume  : {int(MIN_AVG_VOLUME):,}")
+    log.info(f"  Min score   : {MIN_CONFIDENCE}/100")
+    log.info(f"  Min R:R     : 1:{MIN_RR_RATIO}")
+    log.info(f"  SL / TPs    : ATR×{SL_ATR_MULT}  |  1:{TP1_RR}  1:{TP2_RR}  1:{TP3_RR}")
+    log.info("──────────────────────────────────────────────────────────")
+
+
+def warn_no_telegram():
+    if not telegram_ok():
+        log.warning("⚠️  TELEGRAM NOT CONFIGURED — alerts go to console/Railway logs only.")
+        log.warning("   Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID as Railway env vars.")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="NSE Intraday Scanner")
-    parser.add_argument(
-        "--loop", action="store_true",
-        help="Auto-scan every 15 min during market hours (9:15–3:30 IST)"
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Force a scan even outside market hours (for testing)"
-    )
+    parser = argparse.ArgumentParser(description="🇮🇳 NSE Intraday Scanner")
+    parser.add_argument("--loop",  action="store_true",
+                        help="Auto-scan every N min during market hours (use on Railway)")
+    parser.add_argument("--force", action="store_true",
+                        help="Force scan outside market hours (for testing)")
     args = parser.parse_args()
 
     print_banner()
-    check_telegram_config()
+    log_config()
+    warn_no_telegram()
 
+    # ── Single scan ───────────────────────────────────────────────────
     if not args.loop:
-        # ── Single scan mode ──────────────────────────────────────────
         if not is_market_open() and not args.force:
             now = datetime.now(IST)
-            print(f"⏰  Market is currently closed (IST: {now.strftime('%H:%M  %a')}).")
-            print("   Use --force to scan anyway, or --loop to wait for market open.\n")
+            log.info(f"⏰  Market closed ({now.strftime('%H:%M %Z  %A')}).")
+            log.info("   Use --force to scan anyway, or --loop for auto-scheduling.")
             sys.exit(0)
         run_scan()
+        sys.exit(0)
 
-    else:
-        # ── Loop mode ─────────────────────────────────────────────────
-        print(f"🔁  Loop mode active. Scanning every {SCAN_INTERVAL_MIN} min during market hours.\n"
-              "    Press Ctrl+C to stop.\n")
-        while True:
-            try:
-                if is_market_open() or args.force:
-                    run_scan()
-                    log.info(f"💤  Next scan in {SCAN_INTERVAL_MIN} min …")
-                    time.sleep(SCAN_INTERVAL_MIN * 60)
+    # ── Loop mode (Railway) ───────────────────────────────────────────
+    log.info(f"🔁  Loop mode — every {SCAN_INTERVAL_MIN} min  |  Mon–Fri 09:15–15:30 IST")
+    log.info("    Ctrl+C to stop.\n")
+
+    if telegram_ok():
+        send_telegram(format_startup())
+
+    consecutive_errors = 0
+
+    while True:
+        try:
+            if is_market_open() or args.force:
+                run_scan()
+                consecutive_errors = 0
+                log.info(f"💤  Next scan in {SCAN_INTERVAL_MIN} min …\n")
+                time.sleep(SCAN_INTERVAL_MIN * 60)
+            else:
+                now  = datetime.now(IST)
+                secs = secs_to_open()
+                if 0 < secs < 8 * 3600:
+                    mins = secs // 60
+                    log.info(f"⏰  Market opens in {mins} min — sleeping until then …")
+                    time.sleep(max(secs - 30, 60))
                 else:
-                    now = datetime.now(IST)
-                    log.info(f"⏰  Market closed ({now.strftime('%H:%M IST')}) — checking again in 5 min …")
+                    log.info(f"⏰  Market closed ({now.strftime('%H:%M IST  %A')}) — checking in 5 min …")
                     time.sleep(5 * 60)
-            except KeyboardInterrupt:
-                log.info("👋  Scanner stopped.")
-                break
-            except Exception as e:
-                log.error(f"Unexpected error: {e} — retrying in 60s …")
-                time.sleep(60)
+
+        except KeyboardInterrupt:
+            log.info("👋  Scanner stopped.")
+            if telegram_ok():
+                send_telegram("🔴 <b>NSE Scanner stopped.</b>")
+            break
+
+        except Exception as e:
+            consecutive_errors += 1
+            log.error(f"❌  Error #{consecutive_errors}: {e}")
+            log.error(traceback.format_exc())
+            if consecutive_errors >= 5:
+                send_telegram(f"❌ <b>Scanner: {consecutive_errors} errors in a row</b>\n{str(e)[:200]}")
+                consecutive_errors = 0
+            time.sleep(60)
