@@ -12,7 +12,14 @@ import os
 CONFIG = {
     "SCAN_INTERVAL_SECONDS": 90,
     "CANDLE_TIMEFRAME": "5m",
-    "LIQUID_SYMBOLS": [ ... ]  # (your full list unchanged)
+    "LIQUID_SYMBOLS": [
+        "RELIANCE.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","TCS.NS","SBIN.NS","BHARTIARTL.NS","HINDUNILVR.NS","ITC.NS","LT.NS",
+        "AXISBANK.NS","KOTAKBANK.NS","MARUTI.NS","SUNPHARMA.NS","TITAN.NS","ULTRACEMCO.NS","HCLTECH.NS","ASIANPAINTS.NS","BAJFINANCE.NS","ADANIENT.NS",
+        "BAJAJFINSV.NS","DMART.NS","INDUSINDBK.NS","TECHM.NS","WIPRO.NS","NESTLEIND.NS","POWERGRID.NS","NTPC.NS","TATASTEEL.NS","JSWSTEEL.NS",
+        "GRASIM.NS","COALINDIA.NS","HEROMOTOCO.NS","HDFCLIFE.NS","CIPLA.NS","BRITANNIA.NS","ADANIPORTS.NS","APOLLOHOSP.NS","DRREDDY.NS","EICHERMOT.NS",
+        "TATAMOTORS.NS","HINDALCO.NS","SBILIFE.NS","DIVISLAB.NS","JSWENERGY.NS","TRENT.NS","VEDL.NS","M&M.NS","ONGC.NS","BPCL.NS","IOC.NS","GAIL.NS",
+        "IRCTC.NS","PIDILITIND.NS","HAVELLS.NS","DABUR.NS","GODREJCP.NS","COLPAL.NS","MARICO.NS","BERGEPAINT.NS"
+    ],
     "SUPER_TREND_PERIOD": 10,
     "SUPER_TREND_MULTIPLIER": 3.0,
     "EMA_FAST": 9,
@@ -48,7 +55,6 @@ data_cache = {}
 open_positions = []
 last_alert_time = {}
 market_open_sent = False
-closed_trades = []          # NEW: for daily summary & win rate
 
 def send_telegram(message):
     print(message)
@@ -69,7 +75,6 @@ def is_market_open():
     close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return open_time <= now <= close_time
 
-# ========== BATCH DATA FETCH (unchanged) ==========
 def fetch_all_data():
     global data_cache
     symbols_str = " ".join(CONFIG["LIQUID_SYMBOLS"])
@@ -95,17 +100,14 @@ def fetch_all_data():
 def get_latest_data(symbol):
     return data_cache.get(symbol, None)
 
-# ========== INDICATORS (unchanged) ==========
 def calculate_indicators(df):
     df = df.copy()
     df['VWAP'] = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'], anchor="D")
-    
     supertrend = ta.supertrend(df['High'], df['Low'], df['Close'],
                                length=CONFIG["SUPER_TREND_PERIOD"],
                                multiplier=CONFIG["SUPER_TREND_MULTIPLIER"])
     st_dir_col = f"SUPERTd_{CONFIG['SUPER_TREND_PERIOD']}_{CONFIG['SUPER_TREND_MULTIPLIER']}"
     df['SUPERT_DIR'] = supertrend.get(st_dir_col, 0)
-    
     df['EMA9'] = ta.ema(df['Close'], length=CONFIG["EMA_FAST"])
     df['EMA21'] = ta.ema(df['Close'], length=CONFIG["EMA_SLOW"])
     df['RSI'] = ta.rsi(df['Close'], length=CONFIG["RSI_PERIOD"])
@@ -115,7 +117,6 @@ def calculate_indicators(df):
     df['VOL_AVG'] = df['Volume'].rolling(20).mean().fillna(0)
     return df
 
-# ========== SIGNAL GENERATION (unchanged) ==========
 def generate_signal(symbol, df):
     global daily_calls
     if daily_calls >= CONFIG["MAX_CALLS_PER_DAY"]:
@@ -125,11 +126,9 @@ def generate_signal(symbol, df):
         elapsed = (now - last_alert_time[symbol]).total_seconds() / 60
         if elapsed < CONFIG["COOLDOWN_MINUTES"]:
             return None
-    
     required_cols = ['Close', 'SUPERT_DIR', 'EMA9', 'EMA21', 'RSI', 'ATR', 'VOL_AVG']
     if df[required_cols].iloc[-1].isna().any() or df[required_cols].iloc[-2].isna().any():
         return None
-    
     row = df.iloc[-1]
     prev = df.iloc[-2]
     score = 0
@@ -137,7 +136,6 @@ def generate_signal(symbol, df):
     if row['EMA9'] > row['EMA21']: score += 1
     if row['Close'] > row.get('VWAP', row['Close']): score += 1
     if row['RSI'] > CONFIG["RSI_LONG_THRESHOLD"]: score += 1
-    
     macd_col = f"MACDh_{CONFIG['MACD_FAST']}_{CONFIG['MACD_SLOW']}_{CONFIG['MACD_SIGNAL']}"
     if macd_col in row.index and macd_col in prev.index:
         if row[macd_col] > 0 and prev[macd_col] < 0:
@@ -145,13 +143,10 @@ def generate_signal(symbol, df):
     elif 'MACDh_12_26_9' in row.index:
         if row['MACDh_12_26_9'] > 0 and prev['MACDh_12_26_9'] < 0:
             score += 1
-    
     if row['Volume'] > row['VOL_AVG'] * CONFIG["VOLUME_MULTIPLIER"]: score += 1
     if row['Close'] > row['Open']: score += 1
-    
     if score < CONFIG["CONFLUENCE_THRESHOLD"]:
         return None
-    
     entry = row['Close']
     atr = row['ATR']
     sl = entry - (atr * CONFIG["ATR_SL_MULTIPLIER"])
@@ -159,12 +154,10 @@ def generate_signal(symbol, df):
     risk = entry - sl
     if risk <= 0:
         return None
-    
     risk_amount = capital * CONFIG["RISK_PER_TRADE"]
     qty = int(risk_amount / risk)
     if qty < 1:
         return None
-    
     daily_calls += 1
     last_alert_time[symbol] = now
     return {
@@ -177,19 +170,8 @@ def generate_signal(symbol, df):
         "entry_time": now
     }
 
-# ========== REAL SIMULATION (with floating P&L helper) ==========
-def get_unrealized_pnl():
-    unrealized = 0.0
-    for pos in open_positions:
-        sym = pos['symbol'] + ".NS"
-        df = data_cache.get(sym)
-        if df is not None and not df.empty:
-            current_price = df['Close'].iloc[-1]
-            unrealized += (current_price - pos['entry']) * pos['qty']
-    return unrealized
-
 def check_open_positions(df_dict):
-    global capital, open_positions, closed_trades
+    global capital, open_positions
     now = datetime.now(IST)
     closed_positions = []
     for pos in open_positions[:]:
@@ -198,26 +180,21 @@ def check_open_positions(df_dict):
         if df is None or df.empty:
             continue
         current_price = df['Close'].iloc[-1]
-        
         if current_price <= pos['sl']:
             pnl = (current_price - pos['entry']) * pos['qty']
             capital += pnl
-            closed_trades.append({"pnl": pnl, "win": pnl > 0})
             closed_positions.append(f"🛑 {pos['symbol']} SL hit | P&L: ₹{pnl:,.0f}")
             open_positions.remove(pos)
         elif current_price >= pos['target']:
             pnl = (pos['target'] - pos['entry']) * pos['qty']
             capital += pnl
-            closed_trades.append({"pnl": pnl, "win": pnl > 0})
             closed_positions.append(f"🎯 {pos['symbol']} Target hit | P&L: ₹{pnl:,.0f}")
             open_positions.remove(pos)
         elif now.hour == 15 and now.minute >= 25:
             pnl = (current_price - pos['entry']) * pos['qty']
             capital += pnl
-            closed_trades.append({"pnl": pnl, "win": pnl > 0})
             closed_positions.append(f"⏰ {pos['symbol']} Market close exit | P&L: ₹{pnl:,.0f}")
             open_positions.remove(pos)
-    
     for msg in closed_positions:
         send_telegram(msg)
 
@@ -232,69 +209,31 @@ def simulate_trade(signal):
     })
     print(f"[SIMULATION] Opened {signal['symbol']} BUY @ {signal['entry']} | SL {signal['sl']} | Target {signal['target']}")
 
-# ========== DAILY SUMMARY ==========
-def send_daily_summary():
-    if not closed_trades:
-        summary = "📊 <b>Daily Summary</b>\nNo trades closed today."
-    else:
-        total_pnl = sum(t["pnl"] for t in closed_trades)
-        wins = sum(1 for t in closed_trades if t["win"])
-        win_rate = (wins / len(closed_trades)) * 100 if closed_trades else 0
-        summary = (f"📊 <b>Daily Trading Summary</b>\n"
-                   f"📌 Calls generated: {daily_calls}\n"
-                   f"🔄 Trades closed: {len(closed_trades)}\n"
-                   f"🏆 Win rate: {win_rate:.1f}%\n"
-                   f"💰 Realized P&L: ₹{total_pnl:,.0f}\n"
-                   f"🏁 Final capital: ₹{capital:,.0f}")
-    send_telegram(summary)
-
-# ========== MAIN LOOP ==========
 def main_loop():
-    global last_health_ping, daily_calls, last_daily_reset, capital, data_cache, market_open_sent, open_positions, closed_trades
-    send_telegram("🚀 <b>Intraday Call Bot Started</b>\nFINAL v1.0 – Batch + Real P&L + Daily Summary")
-    
+    global last_health_ping, daily_calls, last_daily_reset, capital, data_cache, market_open_sent, open_positions
+    send_telegram("🚀 <b>Intraday Call Bot Started</b>\nBatch fetch + Real simulation + Cooldown (FINAL)")
     while True:
         now = datetime.now(IST)
-        
-        # Daily reset
         if (last_daily_reset is None or now.date() != last_daily_reset.date()) and now.weekday() < 5:
             daily_calls = 0
             capital = CONFIG["SIMULATION_CAPITAL"]
             data_cache = {}
             open_positions = []
             last_alert_time.clear()
-            closed_trades = []
             market_open_sent = False
             last_daily_reset = now
             send_telegram("🌅 <b>New trading day – reset (calls, capital, positions)</b>")
-        
         if not is_market_open():
             time.sleep(60)
             continue
-        
-        # Market open alert
         if CONFIG["SEND_MARKET_OPEN"] and not market_open_sent and now.hour == 9 and now.minute == 15:
             send_telegram("🌅 <b>Market Open – Scanning started</b>")
             market_open_sent = True
-        
-        # Health ping with unrealized P&L
         if last_health_ping is None or (now - last_health_ping).total_seconds() > CONFIG["HEALTH_PING_MINUTES"] * 60:
-            unrealized = get_unrealized_pnl()
-            send_telegram(f"✅ <b>Bot Healthy</b> | Capital: ₹{capital:,.0f} (+₹{unrealized:,.0f} floating) | "
-                          f"Calls today: {daily_calls} | Open: {len(open_positions)}")
+            send_telegram(f"✅ <b>Bot Healthy</b> | Capital: ₹{capital:,.0f} | Calls today: {daily_calls} | Open positions: {len(open_positions)}")
             last_health_ping = now
-        
-        # Daily summary at 15:30
-        if now.hour == 15 and now.minute == 30 and last_daily_reset.date() == now.date():
-            send_daily_summary()
-        
-        # 1. Batch fetch
         fetch_all_data()
-        
-        # 2. Check positions
         check_open_positions(data_cache)
-        
-        # 3. New signals
         for symbol in CONFIG["LIQUID_SYMBOLS"]:
             try:
                 df = get_latest_data(symbol)
@@ -314,7 +253,6 @@ def main_loop():
             except Exception as e:
                 error_msg = f"❌ Error on {symbol}: {str(e)[:100]}"
                 send_telegram(error_msg)
-        
         time.sleep(CONFIG["SCAN_INTERVAL_SECONDS"])
 
 if __name__ == "__main__":
