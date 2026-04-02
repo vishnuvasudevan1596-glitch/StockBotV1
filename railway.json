@@ -1,0 +1,7 @@
+{
+  "build": { "builder": "DOCKERFILE" },
+  "deploy": {
+    "restartPolicy": "ON_FAILURE",
+    "restartDelay": 5
+  }
+}
