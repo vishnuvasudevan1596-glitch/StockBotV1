@@ -42,8 +42,8 @@ CONFIG = {
     "MIN_RR": 1.5,
     "ADX_THRESHOLD": 25,
     "TRADING_START_HOUR": 9,
-    "TRADING_START_MIN": 45,
-    "TRADING_END_HOUR": 14,
+    "TRADING_START_MIN": 30,                # Changed from 45 to 30 (9:30 AM)
+    "TRADING_END_HOUR": 15,
     "TRADING_END_MIN": 30,
     "SIMULATION_CAPITAL": 100000.0,
     "RISK_PER_TRADE": 0.01,
@@ -56,14 +56,14 @@ CONFIG = {
     "MAX_QTY_PCT_OF_ADV": 0.005,
     "SEND_MARKET_OPEN": True,
     "HEALTH_PING_MINUTES": 30,
-    "HISTORICAL_TEST_DATE": "",   # example best month start
+    "HISTORICAL_TEST_DATE": "",   # leave empty for live
     "SIGNAL_SCORE_THRESHOLD": 80,
     "SIGNAL_WINDOW": {
         "ENABLED": True,
-        "START_HOUR": 11,
-        "START_MIN": 30,
-        "END_HOUR": 14,
-        "END_MIN": 30,
+        "START_HOUR": 9,                    # Changed from 11
+        "START_MIN": 30,                    # 9:30 AM
+        "END_HOUR": 15,                     # Changed from 14
+        "END_MIN": 30,                      # 3:30 PM
     },
     "DAILY_MARKET_FILTER": {
         "ENABLED": True,
@@ -115,6 +115,17 @@ def get_india_vix(use_cache=True):
     except:
         pass
     return 20.0
+
+# ==================== DATA CLEANING UTILITY ====================
+def clean_dataframe(df):
+    """Remove duplicate indices, sort, and ensure no NaT or NaN in index."""
+    if df is None or df.empty:
+        return df
+    # Remove duplicate index entries (keep last)
+    df = df[~df.index.duplicated(keep='last')]
+    # Sort index
+    df = df.sort_index()
+    return df
 
 # ==================== NIFTY500 SYMBOLS ====================
 def get_nifty500_symbols():
@@ -207,36 +218,48 @@ def fetch_all_data():
                 sym_data = new_data[symbol].dropna()
                 if sym_data.empty:
                     continue
+                sym_data = clean_dataframe(sym_data)
                 if symbol in data_cache:
-                    df = pd.concat([data_cache[symbol], sym_data]).drop_duplicates()
+                    existing = clean_dataframe(data_cache[symbol])
+                    combined = pd.concat([existing, sym_data]).drop_duplicates()
+                    combined = clean_dataframe(combined)
+                    data_cache[symbol] = combined.tail(100)
                 else:
-                    df = sym_data
-                data_cache[symbol] = df.tail(100)
+                    data_cache[symbol] = sym_data.tail(100)
     except Exception as e:
         send_telegram(f"⚠️ Download error: {str(e)[:100]}")
 
 def get_latest_data(symbol):
-    return data_cache.get(symbol, None)
+    df = data_cache.get(symbol, None)
+    if df is not None and not df.empty:
+        df = clean_dataframe(df)
+    return df
 
 def calculate_indicators(df):
-    df = df.copy()
-    df['VWAP'] = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'], anchor="D")
-    supertrend = ta.supertrend(df['High'], df['Low'], df['Close'],
-                               length=CONFIG["SUPER_TREND_PERIOD"],
-                               multiplier=CONFIG["SUPER_TREND_MULTIPLIER"])
-    st_col = f"SUPERTd_{CONFIG['SUPER_TREND_PERIOD']}_{CONFIG['SUPER_TREND_MULTIPLIER']}"
-    df['SUPERT_DIR'] = supertrend.get(st_col, 0)
-    df['EMA9'] = ta.ema(df['Close'], length=CONFIG["EMA_FAST"])
-    df['EMA21'] = ta.ema(df['Close'], length=CONFIG["EMA_SLOW"])
-    df['RSI'] = ta.rsi(df['Close'], length=CONFIG["RSI_PERIOD"])
-    macd = ta.macd(df['Close'], fast=CONFIG["MACD_FAST"], slow=CONFIG["MACD_SLOW"], signal=CONFIG["MACD_SIGNAL"])
-    df = pd.concat([df, macd], axis=1)
-    df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=CONFIG["ATR_PERIOD"])
-    df['VOL_AVG'] = df['Volume'].rolling(20).mean().fillna(0)
-    adx_df = ta.adx(df['High'], df['Low'], df['Close'], length=14)
-    df = pd.concat([df, adx_df], axis=1)
-    df['SMA20'] = df['Close'].rolling(20).mean()
-    return df
+    if df is None or df.empty:
+        return df
+    df = clean_dataframe(df.copy())
+    try:
+        df['VWAP'] = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'], anchor="D")
+        supertrend = ta.supertrend(df['High'], df['Low'], df['Close'],
+                                   length=CONFIG["SUPER_TREND_PERIOD"],
+                                   multiplier=CONFIG["SUPER_TREND_MULTIPLIER"])
+        st_col = f"SUPERTd_{CONFIG['SUPER_TREND_PERIOD']}_{CONFIG['SUPER_TREND_MULTIPLIER']}"
+        df['SUPERT_DIR'] = supertrend.get(st_col, 0)
+        df['EMA9'] = ta.ema(df['Close'], length=CONFIG["EMA_FAST"])
+        df['EMA21'] = ta.ema(df['Close'], length=CONFIG["EMA_SLOW"])
+        df['RSI'] = ta.rsi(df['Close'], length=CONFIG["RSI_PERIOD"])
+        macd = ta.macd(df['Close'], fast=CONFIG["MACD_FAST"], slow=CONFIG["MACD_SLOW"], signal=CONFIG["MACD_SIGNAL"])
+        df = pd.concat([df, macd], axis=1)
+        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=CONFIG["ATR_PERIOD"])
+        df['VOL_AVG'] = df['Volume'].rolling(20).mean().fillna(0)
+        adx_df = ta.adx(df['High'], df['Low'], df['Close'], length=14)
+        df = pd.concat([df, adx_df], axis=1)
+        df['SMA20'] = df['Close'].rolling(20).mean()
+    except Exception as e:
+        print(f"Indicator calculation error: {e}", flush=True)
+        return None
+    return clean_dataframe(df)
 
 def update_daily_market_filter():
     global market_ok_for_day
@@ -248,7 +271,11 @@ def update_daily_market_filter():
         if nifty.empty or len(nifty) < 50:
             market_ok_for_day = True
             return
+        nifty = clean_dataframe(nifty)
         nifty_indicators = calculate_indicators(nifty)
+        if nifty_indicators is None:
+            market_ok_for_day = True
+            return
         adx = nifty_indicators['ADX_14'].iloc[-1]
         if adx < CONFIG["DAILY_MARKET_FILTER"]["MIN_ADX"]:
             market_ok_for_day = False
@@ -261,6 +288,8 @@ def update_daily_market_filter():
         market_ok_for_day = True
 
 def calculate_signal_score(df):
+    if df is None or df.empty:
+        return 0
     row = df.iloc[-1]
     score = 0
     if row['SUPERT_DIR'] == 1 and row['EMA9'] > row['EMA21']:
@@ -309,6 +338,8 @@ def generate_signal(symbol, df, now=None, vix=None):
     if symbol in last_alert_time:
         if (now - last_alert_time[symbol]).total_seconds() / 60 < CONFIG["COOLDOWN_MINUTES"]:
             return None
+    if df is None or df.empty or len(df) < 50:
+        return None
     required = ['Close', 'SUPERT_DIR', 'EMA9', 'EMA21', 'RSI', 'ATR', 'VOL_AVG', 'ADX_14', 'SMA20']
     if df[required].iloc[-1].isna().any() or df[required].iloc[-2].isna().any():
         return None
@@ -376,6 +407,7 @@ def check_open_positions(df_dict, now=None):
         df = df_dict.get(sym)
         if df is None or df.empty:
             continue
+        df = clean_dataframe(df)
         curr = df['Close'].iloc[-1]
         pnl_gross = 0
         exit_reason = None
@@ -433,9 +465,8 @@ def simulate_trade(signal):
     })
     print(f"[SIM] Opened {signal['symbol']} @ {signal['entry']}", flush=True)
 
-# ==================== HYBRID DATA FETCHING ====================
+# ==================== HYBRID DATA FETCHING (for historical) ====================
 def fetch_5m_data_nsepy(symbol_clean, start_date, end_date):
-    """Fetch 5-minute data using nsepy. Returns DataFrame or None."""
     if not NSEPY_AVAILABLE:
         return None
     try:
@@ -459,7 +490,6 @@ def fetch_5m_data_nsepy(symbol_clean, start_date, end_date):
     return None
 
 def fetch_5m_data_yfinance(symbol, start_date, end_date):
-    """Fetch 5-minute data using yfinance. Returns DataFrame or None."""
     try:
         data = yf.download(symbol, start=start_date, end=end_date,
                            interval="5m", progress=False, auto_adjust=True)
@@ -471,7 +501,6 @@ def fetch_5m_data_yfinance(symbol, start_date, end_date):
     return None
 
 def fetch_5m_data_hybrid(symbol, start_date, end_date):
-    """Hybrid: try nsepy first, then yfinance."""
     symbol_clean = symbol.replace(".NS", "")
     data = fetch_5m_data_nsepy(symbol_clean, start_date, end_date)
     if data is not None and not data.empty:
@@ -482,7 +511,6 @@ def fetch_5m_data_hybrid(symbol, start_date, end_date):
     return pd.DataFrame()
 
 def fetch_5m_data_batch_hybrid(symbols, start_date, end_date):
-    """Fetch 5-minute data for multiple symbols using hybrid method."""
     result = {}
     total = len(symbols)
     print(f"Fetching 5m data for {total} symbols using hybrid method...", flush=True)
@@ -506,7 +534,10 @@ def run_backtest(days=30):
             df = yf.download(sym, period=f"{days}d", interval=CONFIG["CANDLE_TIMEFRAME"], progress=False)
             if len(df) < 100:
                 continue
+            df = clean_dataframe(df)
             df = calculate_indicators(df)
+            if df is None:
+                continue
             for i in range(50, len(df)-1):
                 bar = df.iloc[i].name
                 if not bar.tzinfo:
@@ -540,7 +571,7 @@ def run_historical_replay(test_date_str):
         update_daily_market_filter()
 
         all_symbols = get_nifty500_symbols()
-        symbols = all_symbols[:30]  # use 30 symbols for speed
+        symbols = all_symbols[:30]
         print(f"Using {len(symbols)} symbols", flush=True)
 
         start = (pd.to_datetime(test_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
@@ -552,7 +583,6 @@ def run_historical_replay(test_date_str):
         if not data_dict:
             send_telegram("❌ No 5m data available from any source.")
             print("❌ No 5m data downloaded.", flush=True)
-            print("   Make sure nsepy is installed and working, or try a more recent date.", flush=True)
             return
 
         bar_times = pd.date_range(start=f"{test_date} 09:15", end=f"{test_date} 15:30", freq="5min", tz=IST)
@@ -564,11 +594,10 @@ def run_historical_replay(test_date_str):
             now = bar
             if not (9 <= now.hour <= 15):
                 continue
-            # Update cache from downloaded data
             for symbol, df in data_dict.items():
                 if df is None or df.empty:
                     continue
-                data_cache[symbol] = df
+                data_cache[symbol] = clean_dataframe(df)
             check_open_positions(data_cache, now=now)
             for symbol in symbols:
                 if symbol not in data_cache:
@@ -577,6 +606,8 @@ def run_historical_replay(test_date_str):
                 if df is None or len(df) < 40:
                     continue
                 df = calculate_indicators(df)
+                if df is None:
+                    continue
                 sig = generate_signal(symbol, df, now=now, vix=vix)
                 if sig:
                     send_telegram(
@@ -605,7 +636,7 @@ def run_historical_replay(test_date_str):
 def main_loop():
     global last_health_ping, daily_calls, last_daily_reset, capital, data_cache, market_open_sent, open_positions, LIQUID_SYMBOLS, market_ok_for_day
     print("Entering main loop", flush=True)
-    send_telegram("🚀 Bot started | Hybrid data fetching (nsepy + yfinance) | Signal window 11:30-14:30 | Daily Nifty ADX filter | Trailing stop")
+    send_telegram("🚀 Bot started | Signal window 9:30-15:30 | Daily Nifty ADX filter | Trailing stop")
     while True:
         now = datetime.now(IST)
         if (last_daily_reset is None or now.date() != last_daily_reset.date()) and now.weekday() < 5:
@@ -638,6 +669,8 @@ def main_loop():
                     if df is None or len(df) < 50:
                         continue
                     df = calculate_indicators(df)
+                    if df is None:
+                        continue
                     sig = generate_signal(sym, df, now=now)
                     if sig:
                         send_telegram(
@@ -664,17 +697,18 @@ if __name__ == "__main__":
     CONFIG["TELEGRAM_CHAT_ID"] = os.getenv("TELEGRAM_CHAT_ID")
     print(f"TOKEN set: {bool(CONFIG['TELEGRAM_TOKEN'])}", flush=True)
     hist_dates = os.getenv("HISTORICAL_DATES")
-    if hist_dates:
+    if hist_dates and hist_dates.strip():
         for d in [x.strip() for x in hist_dates.split(",") if x.strip()]:
             run_historical_replay(d)
         sys.exit(0)
-    elif CONFIG.get("HISTORICAL_TEST_DATE"):
+    elif CONFIG.get("HISTORICAL_TEST_DATE") and CONFIG["HISTORICAL_TEST_DATE"].strip():
         run_historical_replay(CONFIG["HISTORICAL_TEST_DATE"])
+        sys.exit(0)
     else:
-        run_backtest()
-    try:
-        main_loop()
-    except Exception as e:
-        send_telegram(f"💥 Crash: {traceback.format_exc()}")
-        print(traceback.format_exc(), flush=True)
-        time.sleep(10)
+        print("Starting live simulation mode...", flush=True)
+        try:
+            main_loop()
+        except Exception as e:
+            send_telegram(f"💥 Crash: {traceback.format_exc()}")
+            print(traceback.format_exc(), flush=True)
+            time.sleep(10)
